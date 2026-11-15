@@ -9,10 +9,11 @@
 //   - failover: a 4xx/5xx/timeout is retried on the next best eligible model (at most 3 dials a
 //     prompt). Every refusal a served prompt recovered from is reported in the
 //     x-makefun-upstream-failures trail header, so the failover column can see it. A 401 (no key
-//     pushed) is not retried: every model would refuse it. A model that refused one prompt is tried
-//     again fresh on the next: a refusal here is a transient rate limit, not a dead model, and
-//     carrying it forward would downgrade every later prompt for no gain. A model that is really
-//     down costs at most one wasted dial a prompt, and the prompt is still served by the next model.
+//     pushed) is not retried: every model would refuse it. A model that refuses twice in a row is
+//     rested for the next two prompts, and a model whose dial never answered is demoted below the
+//     models without one (lib/health.ts): a refusal here is usually a transient rate limit, not a
+//     dead model, so one refusal changes nothing — but a model that is really down costs at most
+//     one wasted dial a prompt before the rest, and the prompt is still served by the next model.
 //   - streaming is buffered: the upstream SSE is read whole and checked (a finish chunk and the
 //     [DONE] terminator) before one byte reaches the client, so a truncated stream fails over
 //     cleanly instead of sending the client a broken event order.
@@ -44,6 +45,7 @@ import {
   openAIToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
+import { HealthTracker, REST_PROMPTS, type RefusalKind } from './lib/health.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -72,6 +74,8 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
+/** The trial's memory of which models refused, answered, or are rested: one instance, the whole trial. */
+const health = new HealthTracker();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -103,11 +107,19 @@ function rankedCandidates(requires: Requirement): ModelRow[] {
 
 /**
  * The dial order for one prompt: the best eligible models first, at most MAX_ATTEMPTS dials in all.
- * A refusal is per prompt, not per trial: a model that refused this prompt is not tried again for
- * it, but the next prompt starts from the top of the list again.
+ * Rested models are out and demoted models are last (lib/health.ts); a refusal is per prompt, not
+ * per trial: a model that refused this prompt is not tried again for it, but the next prompt starts
+ * from the top of the list again unless the breaker has rested it.
  */
-function attemptOrder(requires: Requirement): ModelRow[] {
-  return rankedCandidates(requires).slice(0, MAX_ATTEMPTS);
+function attemptOrder(requires: Requirement, promptIndex: number): ModelRow[] {
+  return health.orderCandidates(rankedCandidates(requires), promptIndex).slice(0, MAX_ATTEMPTS);
+}
+
+/** One refusal, recorded in the trial's health and logged when it rests or demotes the model. */
+function noteRefusal(model: string, kind: RefusalKind, promptIndex: number): void {
+  const outcome = health.record(model, kind, promptIndex);
+  if (outcome === 'rested') log(`health: ${model} rested until prompt ${promptIndex + 1 + REST_PROMPTS} (${kind}, two in a row)`);
+  else if (outcome === 'demoted') log(`health: ${model} demoted (${kind}, dial never answered)`);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -284,33 +296,41 @@ interface Served {
  * report them in the trail header of its 502. A 401 is never retried — it means no key was
  * pushed, and every model would refuse the same way.
  */
-async function serve(body: Json, requires: Requirement): Promise<{ served: Served } | { failures: Refusal[] }> {
+async function serve(body: Json, requires: Requirement, promptIndex: number): Promise<{ served: Served } | { failures: Refusal[] }> {
   const failures: Refusal[] = [];
   const streaming = body.stream === true;
-  for (const candidate of attemptOrder(requires)) {
+  for (const candidate of attemptOrder(requires, promptIndex)) {
     let upstream: Response;
     try {
       upstream = await dial(candidate.id, body);
     } catch {
       // No HTTP answer at all (timeout, unreachable): no trail row exists for a call that never
-      // answered, so this refusal is silent — the next model is tried.
+      // answered, so this refusal is silent — the next model is tried. It still counts for the
+      // model's health: a dial that never answers is the slow signal, and two refusals in a row
+      // rest the model.
+      noteRefusal(candidate.id, 'timeout', promptIndex);
       continue;
     }
     if (upstream.status === 401) {
+      // Never recorded in health: a 401 means no key was pushed, and every model would refuse
+      // the same way, so it says nothing about this model.
       failures.push({ status: 401, code: 'unauthorized', model: candidate.id });
       return { failures };
     }
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
       failures.push({ status: upstream.status, code: errorCodeOf(text, upstream.status), model: candidate.id });
+      noteRefusal(candidate.id, 'http', promptIndex);
       continue;
     }
     if (streaming) {
       const text = await upstream.text().catch(() => '');
       if (!streamComplete(text)) {
         failures.push({ status: upstream.status, code: 'truncated_stream', model: candidate.id });
+        noteRefusal(candidate.id, 'truncated', promptIndex);
         continue;
       }
+      health.success(candidate.id);
       log(`served by ${candidate.id} (stream, ${failures.length} refusal(s) before it)`);
       return { served: { model: candidate.id, failures, json: null, streamText: text } };
     }
@@ -320,12 +340,15 @@ async function serve(body: Json, requires: Requirement): Promise<{ served: Serve
       answer = JSON.parse(text);
     } catch {
       failures.push({ status: upstream.status, code: 'bad_json', model: candidate.id });
+      noteRefusal(candidate.id, 'bad_json', promptIndex);
       continue;
     }
     if (!isRecord(answer)) {
       failures.push({ status: upstream.status, code: 'bad_json', model: candidate.id });
+      noteRefusal(candidate.id, 'bad_json', promptIndex);
       continue;
     }
+    health.success(candidate.id);
     log(`served by ${candidate.id} (json, ${failures.length} refusal(s) before it)`);
     return { served: { model: candidate.id, failures, json: answer, streamText: null } };
   }
@@ -336,7 +359,9 @@ async function serve(body: Json, requires: Requirement): Promise<{ served: Serve
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const outcome = await serve(body, requirementsFor(body));
+  const requires = requirementsFor(body);
+  const promptIndex = manifestIndex - 1;
+  const outcome = await serve(body, requires, promptIndex);
   if (!('served' in outcome)) {
     return sendError(res, 'openai', 502, 'upstream_error', 'every free model refused this prompt', trailHeader(outcome.failures));
   }
@@ -363,10 +388,11 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
+  const promptIndex = manifestIndex - 1;
   const upstreamBody = anthropicToOpenAI(body, 'auto');
   // serve() dials with the body it is given: carry the client's stream flag on the translated body.
   if (body.stream === true) upstreamBody.stream = true;
-  const outcome = await serve(upstreamBody, requires);
+  const outcome = await serve(upstreamBody, requires, promptIndex);
   if (!('served' in outcome)) {
     return sendError(res, 'anthropic', 502, 'api_error', 'every free model refused this prompt', trailHeader(outcome.failures));
   }
